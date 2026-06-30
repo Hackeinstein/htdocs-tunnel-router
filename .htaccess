@@ -1,0 +1,13 @@
+# Deny direct access to internal directories
+<Directory "state">
+    Require all denied
+</Directory>
+<Directory "src">
+    Require all denied
+</Directory>
+
+# Optional: Route /api/* through api.php without query-string workaround
+# Uncomment if mod_rewrite is enabled and you prefer clean API URLs
+#
+# RewriteEngine On
+# RewriteRule ^api/(.*)$ api.php [QSA,L]

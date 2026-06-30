@@ -1,0 +1,18 @@
+# State files — contain API tokens and local paths
+state/config.json
+state/zones_cache.json
+state/activity.json
+state/routes.json
+state/backups/
+
+# Keep the state directory itself
+!state/.htaccess
+!state/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp
