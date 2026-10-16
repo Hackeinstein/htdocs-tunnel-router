@@ -61,6 +61,8 @@ class Reconciler
         }
 
         // Fenced vhosts not in routes.json → drifted
+        $portal = Config::portalHost();
+        if ($portal !== '') $seen[$portal] = true;                 // the file portal's own address is neither drift nor an orphan
         foreach ($vhostMap as $h => $block) {
             if (!isset($seen[$h])) {
                 $results[] = [
@@ -95,27 +97,26 @@ class Reconciler
     }
 
     /**
-     * Build a map of hostname → CF DNS record for all zones referenced in routes.json.
-     * Only includes records whose content matches our tunnel ID.
+     * hostname → CF DNS record for the zones referenced in routes.json, only records aimed at a tunnel.
+     * All zones are fetched in parallel (it used to be one after another) and cached for 20 s; anything that changes
+     * a route drops the cache (see RouteService::dnsChanged()).
      */
     private function buildDnsMap(array $routes): array
     {
-        $zoneIds  = array_unique(array_column($routes, 'zone_id'));
-        $dnsMap   = [];
-        foreach ($zoneIds as $zoneId) {
-            if (!$zoneId) continue;
-            try {
-                $records = $this->cf->listDnsRecords($zoneId);
-                foreach ($records as $rec) {
-                    if ($rec['type'] !== 'CNAME') continue;
-                    // Only track records pointing to our tunnel
-                    if (!str_contains($rec['content'] ?? '', 'cfargotunnel.com')) continue;
-                    $dnsMap[$rec['name']] = $rec;
-                }
-            } catch (Throwable $e) {
-                // CF API down — degrade gracefully, flag no DNS info for this zone
-            }
+        $cache = new Cache(Config::stateDir());
+        $map = []; $specs = [];
+        foreach (array_unique(array_filter(array_column($routes, 'zone_id'))) as $zoneId) {
+            $hit = $cache->get("dnsmap_$zoneId", 20);
+            if ($hit !== null) { $map += $hit; continue; }
+            $specs[$zoneId] = ['GET', "/zones/$zoneId/dns_records", [], ['type' => 'CNAME', 'per_page' => 100]];
         }
-        return $dnsMap;
+        foreach ($specs ? $this->cf->requestMany($specs) : [] as $zoneId => $r) {
+            if (!$r['ok']) continue;                      // CF API down for this zone — degrade gracefully, no DNS info for it
+            $zone = [];
+            foreach ($r['data']['result'] ?? [] as $rec) if (str_contains($rec['content'] ?? '', 'cfargotunnel.com')) $zone[$rec['name']] = $rec;
+            $cache->put("dnsmap_$zoneId", $zone);
+            $map += $zone;
+        }
+        return $map;
     }
 }

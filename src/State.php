@@ -32,6 +32,11 @@ class State
 
     public function upsertRoute(array $route): void
     {
+        withLock($this->routesFile, fn() => $this->upsertUnlocked($route));
+    }
+
+    private function upsertUnlocked(array $route): void
+    {
         $routes   = $this->loadRoutes();
         $hostname = $route['hostname'];
         $found    = false;
@@ -53,10 +58,9 @@ class State
 
     public function removeRoute(string $hostname): void
     {
-        $routes = array_filter(
-            $this->loadRoutes(),
-            fn($r) => ($r['hostname'] ?? '') !== $hostname
-        );
-        $this->saveRoutes(array_values($routes));
+        withLock($this->routesFile, function () use ($hostname) {
+            $routes = array_filter($this->loadRoutes(), fn($r) => ($r['hostname'] ?? '') !== $hostname);
+            $this->saveRoutes(array_values($routes));
+        });
     }
 }

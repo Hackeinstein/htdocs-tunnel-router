@@ -1,18 +1,21 @@
-# State files — contain API tokens and local paths
-state/config.json
-state/zones_cache.json
-state/activity.json
-state/routes.json
-state/backups/
-
-# Keep the state directory itself
+# Everything the tool writes at runtime (config incl. API token, routes, caches, alerts, trash, versions, locks...)
+state/*
 !state/.htaccess
-!state/
 
-# OS
+# Local cloudflared config for this machine (not part of the tool)
+config.yml
+
+# Build tooling (assets/src/node_modules is a temporary symlink made by dev/build_assets.sh)
+assets/src/node_modules
+
+# Packaged copies of the project
+*.zip
+
+# Tooling / OS / editor
+.remember/
+.claude/
+.playwright-mcp/
 .DS_Store
 Thumbs.db
-
-# Editor
 .vscode/
 *.swp

@@ -1,158 +1,71 @@
-<div class="page-header d-print-none">
-  <div class="row align-items-center">
-    <div class="col">
-      <h2 class="page-title">Reconcile</h2>
-      <div class="text-secondary mt-1">Detect drift between routes.json, live vhosts, and Cloudflare DNS</div>
-    </div>
-    <div class="col-auto ms-auto">
-      <button class="btn btn-primary" id="btn-refresh" onclick="location.reload()">
-        <span class="ti ti-refresh me-2"></span>Refresh
-      </button>
-    </div>
-  </div>
+<?= pageHeader('Reconcile', 'Detect drift between routes.json, live vhosts, and Cloudflare DNS',
+  '<button class="btn btn-primary" onclick="location.reload()"><i data-lucide="refresh-cw"></i>Refresh</button>') ?>
+<div class="card mb-6" id="rebuild">
+  <div class="flex flex-wrap items-start justify-between gap-3">
+    <div class="max-w-2xl"><h2 class="card-h !mb-1">Rebuild routes from your live setup</h2>
+      <p class="muted text-sm">Dashboard showing sites as "Not routed" although they are live? The tool's own list (<code>routes.json</code>) is missing or out of date. This scans your <b>Apache vhosts</b> and <b>every Cloudflare zone</b> for records pointing at this tunnel and lets you pick what to add back.
+        <b>Read-only for Apache and Cloudflare</b> — only the tool's list is written, entries you already have are never overwritten, and a snapshot is taken first.</p></div>
+    <button class="btn btn-primary" id="scan"><i data-lucide="scan-search"></i>Scan my setup</button></div>
+  <div id="scan-out" class="mt-4"></div>
 </div>
-
-<div id="reconcile-root">
-  <div class="text-center py-5">
-    <div class="spinner-border text-secondary" role="status"></div>
-    <div class="text-secondary mt-2">Checking for drift...</div>
-  </div>
-</div>
-
+<div id="root"><script>document.write(UI.loading('Checking for drift…'))</script></div>
 <script>
-(async function() {
-  const root = document.getElementById('reconcile-root');
+(async () => {
+  const root = document.getElementById('root'), E = UI.esc;
+  const STATUS = { ok: ['green', 'OK'], dns_missing: ['red', 'DNS missing'], vhost_missing: ['red', 'VHost missing'], both_missing: ['orange', 'Both missing'], drifted: ['yellow', 'Drifted'], dns_only: ['blue', 'DNS only'] };
+  const btn = (action, h, icon, text, cls) => `<button class="btn ${cls} fix" data-a="${action}" data-h="${E(h)}">${UI.i(icon)}${text}</button>`;
+  const actions = r => ({
+    dns_missing:   btn('create_dns', r.hostname, 'cloud-upload', 'Create DNS', 'btn-primary') + btn('delete_vhost', r.hostname, 'trash', 'Remove VHost', 'btn-ghost-danger'),
+    vhost_missing: btn('create_vhost', r.hostname, 'server', 'Create VHost', 'btn-primary') + btn('delete_dns', r.hostname, 'trash', 'Remove DNS', 'btn-ghost-danger'),
+    both_missing:  btn('delete_route_entry', r.hostname, 'trash', 'Remove route entry', 'btn-ghost-danger'),
+    drifted:       `<span class="muted text-xs">Hand-edited vhost — <a class="text-indigo-600 underline" href="?page=detach&hostname=${encodeURIComponent(r.hostname)}">detach</a> to clean up</span>`,
+    dns_only:      btn('delete_dns', r.hostname, 'trash', 'Delete DNS', 'btn-ghost-danger'),
+  })[r.status] || '<span class="text-xs text-green-600">In sync</span>';
 
-  const statusConfig = {
-    ok:           { badge: '<span class="badge bg-success-lt text-success">OK</span>',                    icon: 'ti-circle-check' },
-    dns_missing:  { badge: '<span class="badge bg-danger-lt text-danger">DNS Missing</span>',             icon: 'ti-cloud-off' },
-    vhost_missing:{ badge: '<span class="badge bg-danger-lt text-danger">VHost Missing</span>',           icon: 'ti-server-off' },
-    both_missing: { badge: '<span class="badge bg-orange-lt text-orange">Both Missing</span>',            icon: 'ti-alert-triangle' },
-    drifted:      { badge: '<span class="badge bg-warning-lt text-warning">Drifted</span>',               icon: 'ti-edit' },
-    dns_only:     { badge: '<span class="badge bg-info-lt text-info">DNS Only</span>',                    icon: 'ti-cloud-question' },
-  };
+  // ---- rebuild from the live setup
+  const sc = document.getElementById('scan'), out = document.getElementById('scan-out');
+  const NOTE = { importable: ['green', 'Ready to import'], tracked: ['gray', 'Already tracked'], dns_only: ['yellow', 'DNS only'], project_missing: ['red', 'Folder not found'] };
+  sc.onclick = () => UI.busy(sc, async () => {
+    const d = await UI.api('/api/import/scan'), items = d.items;
+    const failed = Object.entries(d.zones_failed || {});
+    const ready = items.filter(i => i.status === 'importable');
+    out.innerHTML = (failed.length ? UI.warn('Could not read: ' + failed.map(([z, m]) => (z === '*' ? 'zones' : z) + ' (' + m + ')').join('; ')) : '') +
+      (items.length ? `<div class="overflow-x-auto"><table class="tbl"><thead><tr><th class="w-8"><input type="checkbox" id="rb-all" class="size-4 rounded" ${ready.length ? 'checked' : 'disabled'}></th><th>Hostname</th><th>Project folder</th><th>Status</th><th>DNS</th><th>Vhost</th></tr></thead><tbody>
+        ${items.map(i => { const [c, t] = NOTE[i.status] || ['gray', i.status]; return `<tr>
+          <td><input type="checkbox" class="rb size-4 rounded" data-h="${E(i.hostname)}" ${i.status === 'importable' ? 'checked' : 'disabled'}></td>
+          <td><b>${E(i.hostname)}</b>${i.www_alias ? ' ' + UI.badge('blue', '+www') : ''}${i.enabled ? '' : ' ' + UI.badge('yellow', 'disabled')}</td>
+          <td>${i.project ? E(i.project) : '<span class="muted">—</span>'}</td>
+          <td>${UI.badge(c, t)}${i.status === 'dns_only' ? '<div class="muted text-xs">No vhost for it — connect it to a project from Attach Route.</div>' : ''}${i.status === 'importable' && !i.has_dns ? '<div class="muted text-xs">No DNS record found for it.</div>' : ''}${i.status === 'importable' && !i.zone_id ? '<div class="muted text-xs">Cloudflare zone not identified — detaching it later will not remove its DNS record.</div>' : ''}</td>
+          <td>${i.has_dns ? UI.i('check', 'text-green-600') : UI.i('x', 'text-red-600')}</td><td>${i.has_vhost ? UI.i('check', 'text-green-600') : UI.i('x', 'text-red-600')}</td></tr>`; }).join('')}</tbody></table></div>
+        <div class="mt-4 flex items-center gap-3"><button class="btn btn-success" id="rb-go" ${ready.length ? '' : 'disabled'}>${UI.i('download')}Import selected</button><span class="muted text-sm">${d.tracked} route(s) tracked now · ${ready.length} can be imported</span></div>`
+        : UI.empty('search-x', 'Nothing found', 'No tunnel-router vhost blocks and no DNS records pointing at this tunnel.'));
+    const boxes = () => [...out.querySelectorAll('.rb:not(:disabled)')];
+    const all = document.getElementById('rb-all'); if (all) all.onchange = () => boxes().forEach(b => b.checked = all.checked);
+    const go = document.getElementById('rb-go');
+    if (go) go.onclick = () => UI.busy(go, async () => {
+      const hostnames = boxes().filter(b => b.checked).map(b => b.dataset.h);
+      if (!hostnames.length) return UI.toast('Tick at least one site.', 'error');
+      const r = await UI.post('/api/import/apply', { hostnames });
+      await UI.results('Import', r.results.map(x => ({ id: x.id, ok: x.ok, error: x.error || x.detail })));
+      location.reload();
+    });
+  });
 
-  function escapeHtml(s) {
-    if (!s) return '';
-    const d = document.createElement('div');
-    d.textContent = s;
-    return d.innerHTML;
-  }
+  try {
+    const routes = (await UI.api('/api/reconcile')).routes || [];
+    if (!routes.length) { root.innerHTML = UI.empty('circle-check', 'Nothing to reconcile', 'No routes, vhosts, or DNS records found.'); return; }
+    if (routes.every(r => r.status === 'ok')) { root.innerHTML = UI.empty('circle-check', 'All clear', `All ${routes.length} routes are in sync — no drift detected.`); return; }
 
-  async function load() {
-    try {
-      const res = await fetch('api.php?route=/api/reconcile');
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || 'Reconcile failed');
+    root.innerHTML = `<div class="card !p-0"><div class="overflow-x-auto"><table class="tbl"><thead><tr><th>Hostname</th><th>Status</th><th>Details</th><th>Actions</th></tr></thead><tbody>
+      ${routes.map(r => { const [c, l] = STATUS[r.status] || STATUS.both_missing; return `<tr>
+        <td><code>${E(r.hostname)}</code></td><td>${UI.badge(c, l)}</td>
+        <td class="muted text-xs">${r.route_entry ? 'Project: <b>' + E(r.route_entry.project) + '</b>' : 'Not in routes.json'}</td>
+        <td><div class="flex gap-1">${actions(r)}</div></td></tr>`; }).join('')}</tbody></table></div></div>`;
 
-      const results = data.routes || [];
-      const hasIssues = results.some(r => r.status !== 'ok');
-
-      if (!results.length) {
-        root.innerHTML = `<div class="empty">
-          <div class="empty-icon"><span class="ti ti-circle-check fs-1"></span></div>
-          <p class="empty-title">Nothing to reconcile</p>
-          <p class="empty-subtitle text-secondary">No routes, vhosts, or DNS records found.</p>
-        </div>`;
-        return;
-      }
-
-      if (!hasIssues) {
-        root.innerHTML = `<div class="card">
-          <div class="card-body text-center py-4">
-            <span class="ti ti-circle-check text-success fs-1 mb-2 d-block"></span>
-            <h3>All Clear</h3>
-            <p class="text-secondary">All ${results.length} routes are in sync — no drift detected.</p>
-            <button class="btn btn-ghost-primary btn-sm" onclick="location.reload()"><span class="ti ti-refresh me-1"></span>Refresh</button>
-          </div>
-        </div>`;
-        return;
-      }
-
-      const rows = results.map(r => {
-        const cfg = statusConfig[r.status] || statusConfig.both_missing;
-        const routeInfo = r.route_entry
-          ? `<span class="text-secondary small">Project: <strong>${escapeHtml(r.route_entry.project)}</strong> | Zone: ${escapeHtml(r.route_entry.zone_id)}</span>`
-          : '<span class="text-secondary small">Not in routes.json</span>';
-
-        // Action buttons based on status
-        let actions = '';
-        switch (r.status) {
-          case 'dns_missing':
-            actions = `<button class="btn btn-sm btn-primary fix-btn" data-action="create_dns" data-hostname="${escapeHtml(r.hostname)}"><span class="ti ti-cloud-up me-1"></span>Create DNS</button>
-                       <button class="btn btn-sm btn-ghost-danger fix-btn" data-action="delete_vhost" data-hostname="${escapeHtml(r.hostname)}"><span class="ti ti-trash me-1"></span>Remove VHost</button>`;
-            break;
-          case 'vhost_missing':
-            actions = `<button class="btn btn-sm btn-primary fix-btn" data-action="create_vhost" data-hostname="${escapeHtml(r.hostname)}"><span class="ti ti-server me-1"></span>Create VHost</button>
-                       <button class="btn btn-sm btn-ghost-danger fix-btn" data-action="delete_dns" data-hostname="${escapeHtml(r.hostname)}"><span class="ti ti-trash me-1"></span>Remove DNS</button>`;
-            break;
-          case 'both_missing':
-            actions = `<button class="btn btn-sm btn-ghost-danger fix-btn" data-action="delete_route_entry" data-hostname="${escapeHtml(r.hostname)}"><span class="ti ti-trash me-1"></span>Remove Route Entry</button>`;
-            break;
-          case 'drifted':
-            actions = `<span class="text-secondary small">Hand-edited vhost — <a href="?page=detach&hostname=${encodeURIComponent(r.hostname)}">detach</a> to clean up</span>`;
-            break;
-          case 'dns_only':
-            actions = `<button class="btn btn-sm btn-ghost-danger fix-btn" data-action="delete_dns" data-hostname="${escapeHtml(r.hostname)}"><span class="ti ti-trash me-1"></span>Delete DNS</button>`;
-            break;
-          default:
-            actions = '<span class="text-success small">In sync</span>';
-        }
-
-        return `<tr>
-          <td><code>${escapeHtml(r.hostname)}</code></td>
-          <td>${cfg.badge}</td>
-          <td>${routeInfo}</td>
-          <td>${actions}</td>
-        </tr>`;
-      }).join('');
-
-      root.innerHTML = `
-        <div class="card">
-          <div class="card-body">
-            <div class="table-responsive">
-              <table class="table table-vcenter card-table">
-                <thead>
-                  <tr>
-                    <th>Hostname</th>
-                    <th>Status</th>
-                    <th>Details</th>
-                    <th>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>${rows}</tbody>
-              </table>
-            </div>
-          </div>
-        </div>`;
-
-      // Bind fix buttons
-      root.querySelectorAll('.fix-btn').forEach(btn => {
-        btn.addEventListener('click', async function() {
-          this.disabled = true;
-          const hostname = this.dataset.hostname;
-          const action = this.dataset.action;
-          try {
-            const res = await fetch('api.php?route=/api/reconcile/fix', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ hostname, action })
-            });
-            const d = await res.json();
-            if (!d.ok) throw new Error(d.error);
-            location.reload();
-          } catch (e) {
-            alert('Fix failed: ' + e.message);
-            this.disabled = false;
-          }
-        });
-      });
-
-    } catch (e) {
-      root.innerHTML = `<div class="alert alert-danger">Reconcile failed: ${escapeHtml(e.message)}</div>`;
-    }
-  }
-
-  load();
+    root.querySelectorAll('.fix').forEach(b => b.onclick = () => UI.busy(b, async () => {
+      await UI.post('/api/reconcile/fix', { hostname: b.dataset.h, action: b.dataset.a });
+      location.reload();
+    }));
+  } catch (e) { root.innerHTML = UI.errBox('Reconcile failed: ' + e.message); }
 })();
 </script>

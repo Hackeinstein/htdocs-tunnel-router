@@ -13,19 +13,11 @@ class ActivityLog
 
     public function append(string $action, string $hostname, bool $ok, string $detail): void
     {
-        $entries = $this->readAll();
-        array_unshift($entries, [
-            'ts'       => nowUtc(),
-            'action'   => $action,
-            'hostname' => $hostname,
-            'ok'       => $ok,
-            'detail'   => $detail,
-        ]);
-        // Cap size
-        if (count($entries) > self::MAX_ENTRIES) {
-            $entries = array_slice($entries, 0, self::MAX_ENTRIES);
-        }
-        atomicWrite($this->logFile, jsonPretty($entries));
+        withLock($this->logFile, function () use ($action, $hostname, $ok, $detail) {
+            $entries = $this->readAll();
+            array_unshift($entries, ['ts' => nowUtc(), 'action' => $action, 'hostname' => $hostname, 'ok' => $ok, 'detail' => $detail]);
+            atomicWrite($this->logFile, jsonPretty(array_slice($entries, 0, self::MAX_ENTRIES)));
+        });
     }
 
     /** Return most-recent-first, limited to $limit entries, starting at $offset. */

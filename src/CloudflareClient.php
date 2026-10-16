@@ -146,63 +146,83 @@ class CloudflareClient
 
     // -------------------------------------------------------------------------
 
-    private function request(string $method, string $path, array $body = [], array $query = []): array
+    /** One reusable handle per client: later calls in the same request skip DNS + TCP + TLS (that was ~0.5 s each). */
+    private ?\CurlHandle $ch = null;
+    private ?\CurlMultiHandle $mh = null;
+
+    /** @return array<int,mixed> curl options shared by single and parallel requests */
+    private function opts(string $method, string $path, array $body, array $query): array
     {
-        $url = self::BASE . $path;
-        if ($query) $url .= '?' . http_build_query($query);
-
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
+        $url = self::BASE . $path . ($query ? '?' . http_build_query($query) : '');
+        $o = [
+            CURLOPT_URL            => $url,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HTTPHEADER     => [
-                'Authorization: Bearer ' . $this->token,
-                'Content-Type: application/json',
-            ],
-            CURLOPT_TIMEOUT        => 15,
+            CURLOPT_HTTPHEADER     => ['Authorization: Bearer ' . $this->token, 'Content-Type: application/json', 'Accept-Encoding: gzip'],
+            CURLOPT_ENCODING       => '',                  // accept gzip: smaller analytics/DNS payloads
+            CURLOPT_TIMEOUT        => 20,
+            CURLOPT_CONNECTTIMEOUT => 8,
             CURLOPT_SSL_VERIFYPEER => true,
-        ]);
-
-        // Use XAMPP's bundled CA bundle on Windows; fall back to common macOS/Linux paths
-        $caCandidates = [
-            'C:/xampp/php/extras/ssl/cacert.pem',
-            '/Applications/XAMPP/xamppfiles/share/curl/cacert.pem',
-            '/etc/ssl/cert.pem',
-            '/usr/local/etc/openssl/cert.pem',
+            CURLOPT_IPRESOLVE      => CURL_IPRESOLVE_V4,   // avoids the multi-second IPv6-then-IPv4 fallback stall common on Windows
         ];
-        foreach ($caCandidates as $caBundle) {
-            if (file_exists($caBundle)) {
-                curl_setopt($ch, CURLOPT_CAINFO, $caBundle);
-                break;
-            }
-        }
+        if ($ca = caBundle()) $o[CURLOPT_CAINFO] = $ca;
+        // (HTTP version is left to libcurl: it negotiates HTTP/2 on its own, and forcing it broke POST bodies on some builds.)
+        if ($method === 'GET') { $o[CURLOPT_HTTPGET] = true; }
+        elseif ($method === 'POST') { $o[CURLOPT_POST] = true; $o[CURLOPT_POSTFIELDS] = json_encode($body); }
+        else { $o[CURLOPT_CUSTOMREQUEST] = $method; if ($method === 'PATCH' || $method === 'PUT') $o[CURLOPT_POSTFIELDS] = json_encode($body); }
+        return $o;
+    }
 
-        if ($method === 'POST') {
-            curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body));
-        } elseif ($method === 'PATCH') {
-            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PATCH');
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body));
-        } elseif ($method === 'DELETE') {
-            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
-        }
+    public function request(string $method, string $path, array $body = [], array $query = []): array
+    {
+        if ($this->ch === null) $this->ch = curl_init(); else curl_reset($this->ch);   // curl_reset keeps the live connection
+        curl_setopt_array($this->ch, $this->opts($method, $path, $body, $query));
+        $raw  = curl_exec($this->ch);
+        return $this->decode($raw, (int)curl_getinfo($this->ch, CURLINFO_RESPONSE_CODE), curl_error($this->ch), $path);
+    }
 
-        $raw  = curl_exec($ch);
-        $err  = curl_error($ch);
-        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-
-        if ($raw === false) {
-            throw new RuntimeException("CF API curl error: $err");
+    /**
+     * Several independent calls at once (over one HTTP/2 connection when available): total time is the slowest call,
+     * not the sum. $specs = [key => [method, path, body?, query?]].
+     * @return array<string, array{ok: bool, data: ?array, error: ?string}> never throws — each panel handles its own failure
+     */
+    public function requestMany(array $specs): array
+    {
+        if ($this->mh === null) {
+            $this->mh = curl_multi_init();
+            if (defined('CURLMOPT_PIPELINING') && defined('CURLPIPE_MULTIPLEX')) @curl_multi_setopt($this->mh, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
         }
-
-        $decoded = json_decode($raw, true);
-        if (!is_array($decoded)) {
-            throw new RuntimeException("CF API non-JSON response (HTTP $code): " . substr($raw, 0, 200));
+        $handles = [];
+        foreach ($specs as $key => $sp) {
+            $ch = curl_init();
+            curl_setopt_array($ch, $this->opts($sp[0], $sp[1], $sp[2] ?? [], $sp[3] ?? []));
+            curl_multi_add_handle($this->mh, $ch);
+            $handles[$key] = [$ch, $sp[1]];
         }
-        if (!($decoded['success'] ?? false)) {
-            throw new RuntimeException('CF API error (HTTP ' . $code . '): ' . $this->cfErrors($decoded));
-        }
+        do {
+            curl_multi_exec($this->mh, $running);
+            if ($running && curl_multi_select($this->mh, 1.0) === -1) usleep(10000);
+        } while ($running);
 
+        $out = [];
+        foreach ($handles as $key => [$ch, $path]) {
+            try { $out[$key] = ['ok' => true, 'data' => $this->decode(curl_multi_getcontent($ch), (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE), curl_error($ch), $path), 'error' => null]; }
+            catch (Throwable $e) { $out[$key] = ['ok' => false, 'data' => null, 'error' => $e->getMessage()]; }
+            curl_multi_remove_handle($this->mh, $ch); curl_close($ch);
+        }
+        return $out;
+    }
+
+    /** Turn a raw Cloudflare response into its decoded body, or throw a readable error. */
+    private function decode(string|bool|null $raw, int $code, string $err, string $path): array
+    {
+        if ($raw === false || $raw === null || ($raw === '' && $err !== '')) throw new RuntimeException("CF API curl error: $err");
+        $decoded = json_decode((string)$raw, true);
+        if (!is_array($decoded)) throw new RuntimeException("CF API non-JSON response (HTTP $code): " . substr((string)$raw, 0, 200));
+        if ($path === '/graphql') {
+            if (!empty($decoded['errors'])) throw new RuntimeException('CF GraphQL: ' . implode('; ', array_column($decoded['errors'], 'message')));
+            return $decoded['data'] ?? [];
+        }
+        if (!($decoded['success'] ?? false)) throw new RuntimeException('CF API error (HTTP ' . $code . '): ' . $this->cfErrors($decoded));
         return $decoded;
     }
 

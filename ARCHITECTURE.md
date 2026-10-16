@@ -1,5 +1,7 @@
 # htdocs Tunnel Router — Architecture Reference
 
+> **Historical.** This is the original v1 design. Since then the UI was rebuilt (Tailwind + HyperUI patterns, Lucide, ApexCharts, Monaco) and many features were added (domains/tunnels pages, expiry, bulk, Under Attack, DNS, backup/restore, health, per-site file manager, verified Apache reload, access guard). **The README is the current reference**; `dev/run_all.php` is the executable spec. Parts below that mention Tabler or a worker are out of date.
+
 **For agent handoff.** Read this before touching any code.  
 This document is the authoritative design reference. The TASKS.md file tracks what has been built vs. what remains.
 

@@ -1,0 +1,8 @@
+# Only the portal's two entry points may run as PHP; nothing else here is executable, listable or a dotfile.
+Options -Indexes
+<FilesMatch "^(?!(index|api)\.php$).*\.php$">
+    Require all denied
+</FilesMatch>
+<FilesMatch "^\.">
+    Require all denied
+</FilesMatch>

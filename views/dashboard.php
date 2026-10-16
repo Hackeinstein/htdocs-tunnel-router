@@ -1,263 +1,177 @@
-<?php
-$htdocs = htmlspecialchars(Config::load()['paths']['htdocs']);
-?>
-<div class="page-header d-print-none">
-  <div class="row align-items-center">
-    <div class="col">
-      <h2 class="page-title">Dashboard</h2>
-      <div class="text-secondary mt-1">Projects in <code><?= $htdocs ?></code></div>
-    </div>
-    <div class="col-auto ms-auto d-flex gap-2">
-      <button class="btn btn-ghost-secondary btn-sm" onclick="location.reload()">
-        <span class="ti ti-refresh me-1"></span>Refresh
-      </button>
-      <a href="?page=attach" class="btn btn-primary">
-        <span class="ti ti-plug-connected me-1"></span>Attach Route
-      </a>
-    </div>
-  </div>
-</div>
+<?php $htdocs = htmlspecialchars(Config::load()['paths']['htdocs']); ?>
+<?= pageHeader('Dashboard', 'Projects in <code>' . $htdocs . '</code>',
+  '<button class="btn btn-outline" onclick="location.reload()"><i data-lucide="refresh-cw"></i>Refresh</button>
+   <a href="?page=attach" class="btn btn-primary"><i data-lucide="plug-zap"></i>Attach Route</a>') ?>
 
-<div id="dash-alert"></div>
-<div id="dash-stats" class="row mb-4 d-none"></div>
-<div id="dashboard-root">
-  <div class="text-center py-5">
-    <div class="spinner-border text-blue" role="status"></div>
-    <div class="text-secondary mt-2">Loading projects…</div>
-  </div>
-</div>
+<div id="alert"></div>
+<div id="stats" class="mb-6 grid grid-cols-2 gap-4 lg:grid-cols-4"></div>
+<div id="root"><script>document.write(UI.loading('Loading projects…'))</script></div>
 
 <script>
-(async function () {
-  const root      = document.getElementById('dashboard-root');
-  const statsRow  = document.getElementById('dash-stats');
-  const alertBox  = document.getElementById('dash-alert');
+(async () => {
+  const root = document.getElementById('root'), statsEl = document.getElementById('stats');
+  let projects = [], recon = {}, reconOk = false, reconState = 'loading';   // loading → ok | failed
 
-  function esc(s) {
-    if (s == null) return '';
-    const d = document.createElement('div');
-    d.textContent = s;
-    return d.innerHTML;
-  }
-
-  /* ---- fetch projects + reconcile in parallel ---- */
-  let projects = [], reconcileMap = {}, reconcileAvailable = false;
-
-  try {
-    const [pr, rr] = await Promise.all([
-      fetch('api.php?route=/api/projects').then(r => r.json()),
-      fetch('api.php?route=/api/reconcile').then(r => r.json()).catch(() => ({ ok: false, error: 'CF API unreachable' })),
-    ]);
-
-    if (!pr.ok) throw new Error(pr.error || 'Failed to load projects');
-    projects = pr.projects || [];
-
-    if (rr.ok && rr.routes) {
-      reconcileAvailable = true;
-      for (const r of rr.routes) reconcileMap[r.hostname] = r;
-    } else if (rr.error) {
-      alertBox.innerHTML = `<div class="alert alert-warning mb-3">
-        <span class="ti ti-wifi-off me-2"></span>
-        Live DNS check unavailable (<strong>${esc(rr.error)}</strong>) — showing cached status only.
-        <a href="?page=settings" class="ms-2">Check Settings</a>
-      </div>`;
-    }
-  } catch (e) {
-    root.innerHTML = `<div class="alert alert-danger"><span class="ti ti-alert-circle me-2"></span>${esc(e.message)}</div>`;
-    return;
-  }
+  // Local data only: the page paints at once. The Cloudflare DNS check (the slow part) fills in afterwards.
+  try { projects = (await UI.api('/api/projects')).projects || []; }
+  catch (e) { root.innerHTML = UI.errBox(e.message); return; }
 
   if (!projects.length) {
-    root.innerHTML = `<div class="empty py-5">
-      <div class="empty-icon"><span class="ti ti-folder-off" style="font-size:3rem;color:#adb5bd"></span></div>
-      <p class="empty-title">No projects found</p>
-      <p class="empty-subtitle text-secondary">Add project folders to your htdocs directory, then refresh.</p>
-    </div>`;
+    root.innerHTML = UI.empty('folder-x', 'No projects found', 'Add project folders to your htdocs directory, then refresh.');
     return;
   }
 
-  /* ---- stats row ---- */
-  const live     = projects.filter(p => p.route_status === 'active').length;
-  const disabled = projects.filter(p => p.route_status === 'disabled').length;
-  const unrouted = projects.filter(p => p.route_status === 'none').length;
-  const problems = reconcileAvailable
-    ? Object.values(reconcileMap).filter(r => r.status !== 'ok').length
-    : 0;
+  if (projects.length && projects.every(p => p.route_status === 'none')) {
+    document.getElementById('alert').insertAdjacentHTML('beforeend', `<div class="mb-4 flex gap-3 rounded-lg border border-blue-300 bg-blue-50 p-4 text-sm text-blue-900 dark:border-blue-800 dark:bg-blue-950 dark:text-blue-200">${UI.i('info')}
+      <div><b>No routes are being tracked yet.</b> If you had sites live before, they still exist in Apache and Cloudflare — <a class="underline" href="?page=reconcile">rebuild the list from your live setup</a>, or <a class="underline" href="?page=backup">import an old routes.json</a>. Nothing is changed in Apache or Cloudflare.</div></div>`);
+  }
+  const count = s => projects.filter(p => p.route_status === s).length;
+  function drawStats() {
+    const problems = reconOk ? Object.values(recon).filter(r => r.status !== 'ok').length : 0;
+    statsEl.innerHTML =
+      UI.stat('circle-check', 'green', count('active'), 'Live') +
+      UI.stat('folder', 'gray', projects.length, 'Projects') +
+      UI.stat('unlink', 'yellow', count('none'), 'Unrouted') +
+      (reconState === 'loading' ? UI.stat('heart-pulse', 'gray', '…', 'DNS health') : reconState === 'failed' ? UI.stat('wifi-off', 'gray', 'Unknown', 'DNS health')
+        : UI.stat(problems ? 'triangle-alert' : 'heart-pulse', problems ? 'red' : 'green', problems ? problems + ' issue' + (problems > 1 ? 's' : '') : 'All OK', 'DNS health'));
+  }
+  drawStats();
 
-  statsRow.innerHTML = `
-    <div class="col-6 col-sm-3">
-      <div class="card card-sm">
-        <div class="card-body">
-          <div class="row align-items-center">
-            <div class="col-auto"><span class="avatar bg-success-lt text-success"><span class="ti ti-circle-check"></span></span></div>
-            <div class="col"><div class="fw-medium">${live}</div><div class="text-secondary small">Live</div></div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="col-6 col-sm-3">
-      <div class="card card-sm">
-        <div class="card-body">
-          <div class="row align-items-center">
-            <div class="col-auto"><span class="avatar bg-secondary-lt text-secondary"><span class="ti ti-folder"></span></span></div>
-            <div class="col"><div class="fw-medium">${projects.length}</div><div class="text-secondary small">Projects</div></div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="col-6 col-sm-3">
-      <div class="card card-sm">
-        <div class="card-body">
-          <div class="row align-items-center">
-            <div class="col-auto"><span class="avatar bg-yellow-lt text-yellow"><span class="ti ti-unlink"></span></span></div>
-            <div class="col"><div class="fw-medium">${unrouted}</div><div class="text-secondary small">Unrouted</div></div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="col-6 col-sm-3">
-      <div class="card card-sm">
-        <div class="card-body">
-          <div class="row align-items-center">
-            <div class="col-auto"><span class="avatar ${problems > 0 ? 'bg-danger-lt text-danger' : 'bg-green-lt text-success'}"><span class="ti ti-${problems > 0 ? 'alert-triangle' : 'check'}"></span></span></div>
-            <div class="col"><div class="fw-medium">${problems > 0 ? problems + ' issue' + (problems > 1 ? 's' : '') : 'All OK'}</div><div class="text-secondary small">DNS health</div></div>
-          </div>
-        </div>
-      </div>
-    </div>`;
-  statsRow.classList.remove('d-none');
+  const BADGE = {
+    active: ['green', 'Live'], disabled: ['yellow', 'Disabled'], none: ['gray', 'Not routed'],
+    dns_missing: ['red', 'DNS missing'], vhost_missing: ['red', 'VHost missing'], drifted: ['orange', 'Drifted'], broken: ['red', 'Broken'],
+  };
 
-  /* ---- render project cards ---- */
-  const cards = projects.map(p => renderCard(p)).join('');
-  root.innerHTML = `<div class="row row-cards">${cards}</div>`;
+  function card(p) {
+    const r = p.hostname ? recon[p.hostname] : null;
+    let status = p.route_status;
+    if (r && status !== 'none') status = { dns_missing: 'dns_missing', vhost_missing: 'vhost_missing', drifted: 'drifted', both_missing: 'broken' }[r.status] || status;
+    const [color, label] = BADGE[status] || BADGE.none;
+    const routed = status !== 'none';
+    const fix = ['dns_missing', 'vhost_missing', 'drifted', 'broken'].includes(status);
+    const pill = (ok, t) => `<span class="inline-flex items-center gap-1 text-xs ${ok ? 'text-green-600' : 'text-red-600'}">${UI.i(ok ? 'check' : 'x', '!size-3')}${t}</span>`;
 
-  /* ---- bind toggle buttons ---- */
-  root.querySelectorAll('.js-toggle').forEach(btn => {
-    btn.addEventListener('click', async function () {
-      const hostname = this.dataset.hostname;
-      const origHTML = this.innerHTML;
-      this.disabled = true;
-      this.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
-      try {
-        const res  = await fetch(`api.php?route=/api/routes/${encodeURIComponent(hostname)}/toggle`, { method: 'POST' });
-        const data = await res.json();
-        if (!data.ok) throw new Error(data.error);
-        location.reload();
-      } catch (e) {
-        alert('Toggle failed: ' + e.message);
-        this.innerHTML = origHTML;
-        this.disabled = false;
-      }
-    });
+    const page = p.hostname ? '?page=route&host=' + encodeURIComponent(p.hostname) : '?page=project&name=' + encodeURIComponent(p.name);
+    return `<div class="card flex cursor-pointer flex-col gap-3 transition hover:border-indigo-400 hover:shadow-sm" data-card="${UI.esc(p.name)}" data-href="${page}">
+      <div class="flex items-start justify-between gap-2">
+        <div class="flex min-w-0 items-center gap-2">
+          <input type="checkbox" class="sel size-4 shrink-0 rounded border-gray-300" data-name="${UI.esc(p.name)}" data-host="${UI.esc(p.hostname || '')}" aria-label="Select ${UI.esc(p.name)}">
+          <span class="grid size-9 shrink-0 place-content-center rounded-lg bg-gray-100 text-gray-500 dark:bg-gray-800">${UI.i('folder', '!size-5')}</span>
+          <div class="min-w-0"><div class="truncate font-semibold"><a href="${page}" class="hover:text-indigo-600 hover:underline" title="Open the ${p.hostname ? 'route' : 'project'} page">${UI.esc(p.name)}</a></div>
+            <div class="muted truncate text-xs" title="${UI.esc(p.path)}">${UI.esc(p.path)}</div></div>
+        </div>${UI.badge(color, label)}
+      </div>
+      ${p.hostname ? `<span class="inline-flex items-center gap-2 text-sm"><a href="?page=route&host=${encodeURIComponent(p.hostname)}" class="inline-flex items-center gap-1 font-medium text-indigo-600 hover:underline" title="Open this route's page">${UI.i('globe', '!size-3.5')}${UI.esc(p.hostname)}</a><a href="https://${UI.esc(p.hostname)}" target="_blank" rel="noopener" class="text-gray-400 hover:text-indigo-600" title="Open the live site">${UI.i('external-link', '!size-3.5')}</a></span>` : ''}
+      ${routed ? UI.expiryControl(p.hostname, p.expires_at, p.expired_at) : ''}
+      ${routed && reconOk && r ? `<div class="flex gap-3">${pill(r.has_dns, 'DNS')}${pill(r.has_vhost, 'VHost')}</div>` : ''}
+      ${routed && reconState === 'loading' ? '<div class="muted text-xs">Checking DNS…</div>' : ''}
+      ${routed && reconState === 'failed' ? '<div class="muted text-xs">DNS unknown — Cloudflare not reachable</div>' : ''}
+      <div class="mt-auto flex flex-wrap gap-2 pt-1">
+        <a href="?page=files&${p.hostname ? 'site=' + encodeURIComponent(p.hostname) : 'project=' + encodeURIComponent(p.name)}" class="btn btn-ghost" title="Open this site's file manager">${UI.i('folder-code')}Files</a>
+        ${routed ? `
+          <button class="btn btn-outline js-toggle" data-host="${UI.esc(p.hostname)}">${UI.i(p.route_status === 'active' ? 'toggle-right' : 'toggle-left')}${p.route_status === 'active' ? 'Disable' : 'Enable'}</button>
+          <a href="?page=detach&hostname=${encodeURIComponent(p.hostname)}" class="btn btn-ghost-danger">${UI.i('trash')}Detach</a>
+          ${fix ? `<a href="?page=reconcile" class="btn btn-ghost text-orange-600">${UI.i('wrench')}Fix drift</a>` : ''}`
+        : `<a href="?page=attach&project=${encodeURIComponent(p.name)}" class="btn btn-primary">${UI.i('plug-zap')}Attach</a>
+           <button class="btn btn-outline js-share" data-project="${UI.esc(p.name)}">${UI.i('share-2')}Share</button>`}
+      </div></div>`;
+  }
+
+  root.innerHTML = `<label class="mb-3 inline-flex items-center gap-2 text-sm"><input type="checkbox" id="selAll" class="size-4 rounded border-gray-300"> Select all</label>
+    <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">${projects.map(card).join('')}</div>
+    <div id="bulkbar" hidden class="fixed bottom-4 left-1/2 z-40 flex max-w-[95vw] -translate-x-1/2 flex-wrap items-center gap-2 rounded-lg border border-gray-200 bg-white p-3 shadow-lg lg:ml-32 dark:border-gray-700 dark:bg-gray-900">
+      <span class="px-2 text-sm font-medium" id="bulkcount"></span>
+      <button class="btn btn-outline" data-bulk="attach">${UI.i('plug-zap')}Attach</button>
+      <button class="btn btn-outline" data-bulk="enable">${UI.i('toggle-right')}Enable</button>
+      <button class="btn btn-outline" data-bulk="disable">${UI.i('toggle-left')}Disable</button>
+      <button class="btn btn-outline" data-bulk="expiry">${UI.i('timer')}Expiry</button>
+      <button class="btn btn-danger" data-bulk="detach">${UI.i('trash')}Detach</button>
+      <button class="btn btn-ghost" id="bulkclear" aria-label="Clear selection">${UI.i('x')}</button></div>`;
+
+  // ---- bulk selection ----
+  const boxes = () => [...root.querySelectorAll('.sel')];
+  const picked = () => boxes().filter(b => b.checked);
+  const bar = document.getElementById('bulkbar');
+  function refreshBar() {
+    const sel = picked(), routed = sel.filter(b => b.dataset.host), free = sel.length - routed.length;
+    bar.hidden = !sel.length;
+    document.getElementById('bulkcount').textContent = sel.length + ' selected';
+    bar.querySelectorAll('[data-bulk]').forEach(b => b.hidden = b.dataset.bulk === 'attach' ? !free : !routed.length);
+    document.getElementById('selAll').checked = sel.length === projects.length;
+  }
+  root.addEventListener('change', e => { if (e.target.classList.contains('sel')) refreshBar(); });
+  document.getElementById('selAll').onchange = e => { boxes().forEach(b => b.checked = e.target.checked); refreshBar(); };
+  document.getElementById('bulkclear').onclick = () => { boxes().forEach(b => b.checked = false); refreshBar(); };
+
+  async function runBulk(btn, title, body) {
+    await UI.busy(btn, async () => { const r = await UI.post('/api/bulk', body); await UI.results(title, r.results); location.reload(); });
+  }
+  bar.querySelectorAll('[data-bulk]').forEach(btn => btn.onclick = async () => {
+    const kind = btn.dataset.bulk, sel = picked();
+    const hostnames = sel.map(b => b.dataset.host).filter(Boolean), free = sel.filter(b => !b.dataset.host).map(b => b.dataset.name);
+    if (kind === 'attach') return bulkAttach(btn, free);
+    if (kind === 'detach' && !await UI.confirm('Detach ' + hostnames.length + ' route(s)?', 'Deletes their DNS records and vhost blocks. Project folders are not touched.', 'Detach all')) return;
+    let extra = {};
+    if (kind === 'expiry') { extra = await UI.pickExpiry(hostnames.length + ' routes', null, hostnames.length); if (!extra) return; }
+    runBulk(btn, { enable: 'Enable', disable: 'Disable', detach: 'Detach', expiry: 'Set expiry' }[kind], { action: kind, hostnames, ...extra });
   });
 
-  /* ---- card renderer ---- */
-  function renderCard(p) {
-    const recon  = p.hostname ? (reconcileMap[p.hostname] ?? null) : null;
-    const dnsOk  = recon ? recon.has_dns   : null;  // null = unknown
-    const vhostOk= recon ? recon.has_vhost : null;
-    const rStatus= recon ? recon.status    : p.route_status;
-
-    // Compute display status
-    let status = p.route_status; // active | disabled | none
-    if (recon && p.route_status !== 'none') {
-      if (recon.status === 'dns_missing')   status = 'dns_missing';
-      else if (recon.status === 'vhost_missing') status = 'vhost_missing';
-      else if (recon.status === 'drifted')  status = 'drifted';
-      else if (recon.status === 'both_missing') status = 'broken';
-    }
-
-    const badgeCfg = {
-      active:        { cls: 'bg-success text-white',          label: 'Live'          },
-      disabled:      { cls: 'bg-warning text-white',          label: 'Disabled'      },
-      none:          { cls: 'bg-secondary-lt text-secondary', label: 'Not Routed'    },
-      dns_missing:   { cls: 'bg-danger text-white',           label: 'DNS Missing'   },
-      vhost_missing: { cls: 'bg-danger text-white',           label: 'VHost Missing' },
-      drifted:       { cls: 'bg-orange text-white',           label: 'Drifted'       },
-      broken:        { cls: 'bg-danger text-white',           label: 'Broken'        },
+  async function bulkAttach(btn, names) {
+    let zones; try { zones = (await UI.api('/api/zones')).zones; } catch (e) { return UI.toast(e.message, 'error'); }
+    let last = ''; try { last = localStorage.getItem('share_zone') || ''; } catch (e) {}
+    const d = UI.modal(`<h3 class="text-lg font-semibold">Attach ${names.length} project(s)</h3>
+      <div class="mt-4 grid gap-3">
+        <div><label class="label">Domain</label><select class="input" id="ba-zone">${zones.map(z => `<option value="${z.id}" ${z.id === last ? 'selected' : ''}>${UI.zoneLabel(z)}</option>`).join('')}</select></div>
+        <div><label class="label">Subdomain pattern</label><input class="input" id="ba-pat" value="{project}"><p class="hint">Use <code>{project}</code>, e.g. <code>{project}.dev</code>. Folder names are made DNS-safe.</p></div>
+        <div class="code max-h-32 overflow-y-auto" id="ba-prev"></div>
+        <label class="flex items-center gap-3">${UI.toggle('ba-www')}<span class="text-sm">Add www alias</span></label>
+        <div><label class="label">Expires</label>${UI.expiryField('ba-exp')}</div></div>
+      <div class="mt-5 flex justify-end gap-2"><button class="btn btn-outline" id="ba-cancel">Cancel</button><button class="btn btn-primary" id="ba-go">Attach all</button></div>`);
+    UI.wireExpiryField('ba-exp');
+    const slug = n => n.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 63);
+    const zoneName = () => (zones.find(z => z.id === d.querySelector('#ba-zone').value) || {}).name || '';
+    const prev = () => {
+      const pat = d.querySelector('#ba-pat').value.trim();
+      d.querySelector('#ba-prev').textContent = pat.includes('{project}') ? names.map(n => pat.replace('{project}', slug(n)).replace(/^\.+|\.+$/g, '') + '.' + zoneName()).join('\n') : 'Pattern must contain {project}';
     };
-    const bc    = badgeCfg[status] ?? badgeCfg.none;
-    const badge = `<span class="badge ${bc.cls}">${bc.label}</span>`;
-
-    const isRouted = p.route_status === 'active' || p.route_status === 'disabled';
-
-    // Hostname row
-    const hostnameHtml = p.hostname
-      ? `<div class="mt-2">
-           <a href="https://${esc(p.hostname)}" target="_blank" rel="noopener" class="d-inline-flex align-items-center gap-1 text-reset text-decoration-none">
-             <span class="ti ti-world text-secondary" style="font-size:.9rem"></span>
-             <code class="small">${esc(p.hostname)}</code>
-             <span class="ti ti-external-link text-secondary" style="font-size:.75rem"></span>
-           </a>
-         </div>`
-      : '';
-
-    // DNS + VHost health pills (only when reconcile data is available)
-    let healthHtml = '';
-    if (isRouted && reconcileAvailable && recon) {
-      const pill = (ok, label) => {
-        const color = ok ? 'text-success' : 'text-danger';
-        const icon  = ok ? 'ti-check' : 'ti-x';
-        return `<span class="small ${color} d-flex align-items-center gap-1"><span class="ti ${icon}" style="font-size:.8rem"></span>${label}</span>`;
-      };
-      healthHtml = `<div class="d-flex gap-3 mt-2">
-        ${pill(dnsOk, 'DNS')}
-        ${pill(vhostOk, 'VHost')}
-      </div>`;
-    } else if (isRouted && !reconcileAvailable) {
-      healthHtml = `<div class="mt-2"><span class="text-secondary small"><span class="ti ti-cloud-question me-1"></span>DNS unknown — CF API not reachable</span></div>`;
-    }
-
-    // Action buttons
-    let actionsHtml = '';
-    if (isRouted) {
-      const isEnabled   = p.route_status === 'active';
-      const toggleLabel = isEnabled ? 'Disable' : 'Enable';
-      const toggleIcon  = isEnabled ? 'ti-toggle-right' : 'ti-toggle-left';
-      const needsFix    = ['dns_missing','vhost_missing','drifted','broken'].includes(status);
-      actionsHtml = `<div class="d-flex flex-wrap gap-2 mt-3">
-        <button class="btn btn-sm btn-ghost-secondary js-toggle" data-hostname="${esc(p.hostname)}">
-          <span class="ti ${toggleIcon} me-1"></span>${toggleLabel}
-        </button>
-        <a href="?page=detach&hostname=${encodeURIComponent(p.hostname)}" class="btn btn-sm btn-ghost-danger">
-          <span class="ti ti-trash me-1"></span>Detach
-        </a>
-        ${needsFix ? `<a href="?page=reconcile" class="btn btn-sm btn-ghost-warning"><span class="ti ti-refresh-alert me-1"></span>Fix drift</a>` : ''}
-      </div>`;
-    } else {
-      actionsHtml = `<div class="mt-3">
-        <a href="?page=attach&project=${encodeURIComponent(p.name)}" class="btn btn-sm btn-primary">
-          <span class="ti ti-plug-connected me-1"></span>Attach
-        </a>
-      </div>`;
-    }
-
-    // Top colour bar
-    const barColor = { active: 'bg-success', disabled: 'bg-warning', dns_missing: 'bg-danger', vhost_missing: 'bg-danger', drifted: 'bg-warning', broken: 'bg-danger' }[status] ?? '';
-    const topBar   = barColor ? `<div class="card-status-top ${barColor}"></div>` : '';
-
-    return `<div class="col-md-6 col-xl-4">
-      <div class="card h-100">
-        ${topBar}
-        <div class="card-body">
-          <div class="d-flex align-items-start justify-content-between gap-2 mb-1">
-            <div class="d-flex align-items-center gap-2 min-w-0">
-              <span class="avatar avatar-sm bg-secondary-lt text-secondary flex-shrink-0">
-                <span class="ti ti-folder-filled" style="font-size:1rem"></span>
-              </span>
-              <div class="min-w-0">
-                <div class="fw-semibold text-truncate" title="${esc(p.name)}">${esc(p.name)}</div>
-                <div class="text-secondary text-truncate" style="font-size:.72rem" title="${esc(p.path)}">${esc(p.path)}</div>
-              </div>
-            </div>
-            <div class="flex-shrink-0">${badge}</div>
-          </div>
-          ${hostnameHtml}
-          ${healthHtml}
-          ${actionsHtml}
-        </div>
-      </div>
-    </div>`;
+    d.querySelector('#ba-pat').oninput = prev; d.querySelector('#ba-zone').onchange = prev; prev();
+    d.querySelector('#ba-cancel').onclick = () => d.close();
+    const go = d.querySelector('#ba-go');
+    go.onclick = () => UI.busy(go, async () => {
+      let exp; try { exp = UI.readExpiryField('ba-exp'); } catch (e) { return UI.toast(e.message, 'error'); }
+      const zone_id = d.querySelector('#ba-zone').value;
+      try { localStorage.setItem('share_zone', zone_id); } catch (e) {}
+      const r = await UI.post('/api/bulk', { action: 'attach', projects: names, zone_id, pattern: d.querySelector('#ba-pat').value.trim(),
+                                              www_alias: d.querySelector('#ba-www').checked, ...exp });
+      d.close(); await UI.results('Attach', r.results); location.reload();
+    });
   }
+
+  function bindCards(scope) {
+    scope.querySelectorAll('.js-share').forEach(b => b.onclick = () => UI.share(b.dataset.project).then(() => {}));
+    UI.bindExpiry(scope, () => location.reload());
+    scope.querySelectorAll('.js-toggle').forEach(b => b.onclick = () => UI.busy(b, async () => {
+      await UI.post('/api/routes/' + encodeURIComponent(b.dataset.host) + '/toggle');
+      location.reload();
+    }));
+  }
+  bindCards(root);
+  root.addEventListener('click', e => {
+    if (e.target.closest('a, button, input, select, label, textarea, dialog')) return;       // those do their own thing
+    const card = e.target.closest('[data-card]'); if (card && card.dataset.href) location.href = card.dataset.href;
+  });
+
+  // ---- the slow part: compare with live DNS, then update only what changed (selection is kept)
+  UI.api('/api/reconcile', { allowFail: true }).catch(e => ({ ok: false, error: e.message })).then(rr => {
+    if (rr.ok) { reconOk = true; reconState = 'ok'; for (const r of rr.routes) recon[r.hostname] = r; }
+    else { reconState = 'failed'; document.getElementById('alert').insertAdjacentHTML('beforeend', UI.warn('Live DNS check unavailable (' + (rr.error || 'Cloudflare unreachable') + ') — showing local status only.')); }
+    projects.forEach(p => {
+      const old = root.querySelector(`[data-card="${CSS.escape(p.name)}"]`); if (!old) return;
+      const checked = old.querySelector('.sel').checked;
+      old.outerHTML = card(p);
+      const fresh = root.querySelector(`[data-card="${CSS.escape(p.name)}"]`); fresh.querySelector('.sel').checked = checked; bindCards(fresh);
+    });
+    drawStats(); refreshBar();
+  });
 })();
 </script>
